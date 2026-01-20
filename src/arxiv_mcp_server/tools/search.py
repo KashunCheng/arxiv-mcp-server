@@ -197,6 +197,31 @@ def _process_paper(paper: arxiv.Result) -> Dict[str, Any]:
     }
 
 
+def _arxiv_url_encoding(url: str) -> str:
+    """Fix URL encoding issues with arXiv date filters.
+
+    The arxiv package URL-encodes + signs, but arXiv API requires literal +
+    in submittedDate:[START+TO+END] syntax.
+    """
+    if "submittedDate" in url:
+        url = url.replace("submittedDate%3A%5B", "submittedDate:[")
+        url = url.replace("%2BTO%2B", "+TO+")
+        url = url.replace("%5D&", "]&")  # End bracket before next param
+        url = url.replace("%5D", "]")  # End bracket at end of URL
+    return url
+
+
+# Monkey-patch arxiv.Client to fix date filter URL encoding
+_original_try_parse_feed = arxiv.Client._Client__try_parse_feed
+
+
+def _patched_try_parse_feed(self, url, *args, **kwargs):
+    url = _arxiv_url_encoding(url)
+    return _original_try_parse_feed(self, url, *args, **kwargs)
+
+
+arxiv.Client._Client__try_parse_feed = _patched_try_parse_feed
+
 async def handle_search(arguments: Dict[str, Any]) -> List[types.TextContent]:
     """Handle paper search requests with improved arXiv API integration."""
     try:
@@ -231,14 +256,13 @@ async def handle_search(arguments: Dict[str, Any]) -> List[types.TextContent]:
             query_parts.append(f"({category_filter})")
             logger.debug(f"Added category filter: {category_filter}")
 
-        # Add date filtering using arXiv API syntax
-        # Temporarily disable server-side date filtering due to API issues
-        # Will filter client-side for now
+        # Add date filtering using arXiv API syntax (with monkey-patch fixing URL encoding)
         date_from_arg = arguments.get("date_from")
         date_to_arg = arguments.get("date_to")
         if date_from_arg or date_to_arg:
-            logger.debug(f"Date filtering requested: {date_from_arg} to {date_to_arg}")
-            # We'll handle this client-side after getting results
+            date_filter = _build_date_filter(date_from_arg, date_to_arg)
+            query_parts.append(date_filter)
+            logger.debug(f"Added date filter: {date_filter}")
 
         # Combine query parts
         if not query_parts:
@@ -248,8 +272,8 @@ async def handle_search(arguments: Dict[str, Any]) -> List[types.TextContent]:
                 )
             ]
 
-        # Combine query parts - arXiv uses space for AND by default
-        final_query = " ".join(query_parts)
+        # Combine query parts with explicit AND for proper filtering
+        final_query = " AND ".join(query_parts)
         logger.debug(f"Final arXiv query: {final_query}")
 
         # Increase max_results slightly to account for any edge cases
@@ -271,48 +295,15 @@ async def handle_search(arguments: Dict[str, Any]) -> List[types.TextContent]:
             sort_by=sort_criterion,
         )
 
-        # Process results with client-side date filtering
+        # Process results (date filtering now handled server-side via API query)
         results = []
         result_count = 0
 
-        # Parse date filters if provided
-        date_from_parsed = None
-        date_to_parsed = None
-        if date_from_arg:
-            try:
-                date_from_parsed = parser.parse(date_from_arg).replace(
-                    tzinfo=timezone.utc
-                )
-            except (ValueError, TypeError) as e:
-                return [
-                    types.TextContent(
-                        type="text", text=f"Error: Invalid date_from format - {str(e)}"
-                    )
-                ]
-
-        if date_to_arg:
-            try:
-                date_to_parsed = parser.parse(date_to_arg).replace(tzinfo=timezone.utc)
-            except (ValueError, TypeError) as e:
-                return [
-                    types.TextContent(
-                        type="text", text=f"Error: Invalid date_to format - {str(e)}"
-                    )
-                ]
 
         for paper in client.results(search):
             if result_count >= max_results:
                 break
 
-            # Apply client-side date filtering
-            paper_date = paper.published
-            if not paper_date.tzinfo:
-                paper_date = paper_date.replace(tzinfo=timezone.utc)
-
-            if date_from_parsed and paper_date < date_from_parsed:
-                continue
-            if date_to_parsed and paper_date > date_to_parsed:
-                continue
 
             results.append(_process_paper(paper))
             result_count += 1
